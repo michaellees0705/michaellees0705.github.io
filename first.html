@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>Browser DOM Sync</title>
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.6.1/sockjs.min.js"></script>
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/vertx/3.9.4/vertx-eventbus.min.js"></script>
+		<style>
+			body {
+				margin: 0;
+				padding: 20px;
+				font-family: Arial, sans-serif;
+			}
+
+			.container {
+				display: flex;
+				gap: 20px;
+				height: calc(100vh - 40px);
+			}
+
+			.controls {
+				width: 300px;
+				padding: 20px;
+				background: #f5f5f5;
+				border-radius: 8px;
+			}
+
+			.preview-container {
+				flex-grow: 1;
+				display: flex;
+				flex-direction: column;
+			}
+
+			.preview-header {
+				padding: 10px;
+				background: #f5f5f5;
+				border-radius: 8px 8px 0 0;
+				margin-bottom: 1px;
+			}
+
+			.preview {
+				flex-grow: 1;
+				border: 1px solid #ccc;
+				border-radius: 0 0 8px 8px;
+				background: white;
+			}
+
+			.preview iframe {
+				width: 100%;
+				height: 100%;
+				border: none;
+			}
+
+			.url-input {
+				width: 100%;
+				padding: 8px;
+				margin-bottom: 10px;
+				border: 1px solid #ccc;
+				border-radius: 4px;
+			}
+
+			button {
+				padding: 8px 16px;
+				background: #007bff;
+				color: white;
+				border: none;
+				border-radius: 4px;
+				cursor: pointer;
+			}
+
+			button:hover {
+				background: #0056b3;
+			}
+
+			.status {
+				margin-top: 10px;
+				padding: 10px;
+				border-radius: 4px;
+			}
+
+			.success {
+				background: #d4edda;
+				color: #155724;
+			}
+
+			.error {
+				background: #f8d7da;
+				color: #721c24;
+			}
+
+			.inspector {
+				margin-top: 20px;
+				border-top: 1px solid #ccc;
+				padding-top: 20px;
+			}
+
+			.style-editor {
+				margin-top: 10px;
+			}
+
+			.style-property {
+				display: flex;
+				gap: 8px;
+				margin-bottom: 8px;
+			}
+
+			.style-property input {
+				padding: 4px;
+				border: 1px solid #ccc;
+				border-radius: 4px;
+			}
+
+			.style-property-name {
+				width: 40%;
+			}
+
+			.style-property-value {
+				width: 60%;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="container">
+			<div class="controls">
+				<h2>Browser Control</h2>
+				<input
+					type="text"
+					id="urlInput"
+					class="url-input"
+					placeholder="Enter URL (e.g., https://example.com)" />
+				<button onclick="navigate()">Navigate</button>
+				<div
+					id="status"
+					class="status"></div>
+			</div>
+
+			<div class="preview-container">
+				<div class="preview-header">
+					<span id="previewUrl"></span>
+				</div>
+				<div class="preview">
+					<iframe id="previewFrame"></iframe>
+				</div>
+			</div>
+		</div>
+
+		<script>
+			let eventBus;
+			let mutationObserver = null;
+			let selectedElement = null;
+			let isProcessingServerUpdate = false;
+			let isFirstLoad = true;
+
+			function initializeEventBus() {
+				eventBus = new EventBus('http://localhost:8080/eventbus');
+
+				eventBus.onopen = function () {
+					updateStatus('Connected to server', 'success');
+
+					// Register handlers
+					eventBus.registerHandler('browser.domUpdate', (error, message) => {
+						if (error) {
+							updateStatus('Error receiving DOM update: ' + error, 'error');
+							return;
+						}
+
+						isProcessingServerUpdate = true;
+						updatePreview(message.body.html);
+						document.getElementById('previewUrl').textContent =
+							message.body.url;
+						isProcessingServerUpdate = false;
+					});
+				};
+
+				eventBus.onerror = function (error) {
+					updateStatus('Connection error: ' + error, 'error');
+				};
+			}
+
+			function navigate() {
+				const url = document.getElementById('urlInput').value;
+				if (!url) {
+					updateStatus('Please enter a URL', 'error');
+					return;
+				}
+				isFirstLoad = true;
+				updateStatus('Loading...', 'status');
+				eventBus.send('browser.navigate', { url: url }, (error, response) => {
+					if (error) {
+						updateStatus('Navigation failed: ' + error.message, 'error');
+					} else {
+						updateStatus('Navigation successful', 'success');
+					}
+				});
+			}
+
+			function updatePreview(html) {
+				const frame = document.getElementById('previewFrame');
+				const doc = frame.contentDocument || frame.contentWindow.document;
+				// Write the HTML content
+				doc.open();
+				doc.write(html);
+				doc.close();
+
+				observeChanges(doc);
+				doc.addEventListener('click', handleClick, true);
+			}
+
+			function generateUniqueSelector(element) {
+				// If element has a unique ID, use it
+				if (element.id) {
+					return '#' + element.id;
+				}
+
+				// Get path of indices to uniquely identify the element
+				let path = [];
+				let current = element;
+
+				while (current && current.parentElement) {
+					let parent = current.parentElement;
+					let children = Array.from(parent.children);
+					let index = children.indexOf(current);
+
+					// Build selector part for current element
+					let selectorPart = current.tagName.toLowerCase();
+					if (current.className) {
+						selectorPart += '.' + Array.from(current.classList).join('.');
+					}
+					if (current.getAttribute('name')) {
+						selectorPart += `[name="${current.getAttribute('name')}"]`;
+					}
+					// Add index to make it unique
+					selectorPart += `:nth-child(${index + 1})`;
+
+					path.unshift(selectorPart);
+					current = parent;
+				}
+
+				// Add html and body to ensure complete path
+				if (path[0] !== 'html') {
+					path.unshift('html');
+				}
+
+				return path.join(' > ');
+			}
+
+			function verifyUniqueSelector(selector, element, doc) {
+				const elements = doc.querySelectorAll(selector);
+				if (elements.length === 1) {
+					return selector;
+				}
+
+				// If selector isn't unique, add more specific attributes
+				let enhancedSelector = selector;
+				const attributes = Array.from(element.attributes);
+
+				for (let attr of attributes) {
+					if (!['class', 'id'].includes(attr.name)) {
+						enhancedSelector += `[${attr.name}="${attr.value}"]`;
+						const newElements = doc.querySelectorAll(enhancedSelector);
+						if (newElements.length === 1) {
+							return enhancedSelector;
+						}
+					}
+				}
+
+				// If still not unique, add text content matching if element has text
+				if (element.textContent.trim()) {
+					const textSelector = `${enhancedSelector}:has(text()[contains(., "${element.textContent.trim()}")])`;
+					const textElements = doc.querySelectorAll(textSelector);
+					if (textElements.length === 1) {
+						return textSelector;
+					}
+				}
+
+				return enhancedSelector;
+			}
+
+			function handleClick(event) {
+				const doc = event.target.ownerDocument;
+				const selector = generateUniqueSelector(event.target);
+				const verifiedSelector = verifyUniqueSelector(
+					selector,
+					event.target,
+					doc
+				);
+
+				// Test if the selector is truly unique
+				const elements = doc.querySelectorAll(verifiedSelector);
+				if (elements.length !== 1) {
+					console.warn('Warning: Selector is not unique:', verifiedSelector);
+				}
+
+				const clickData = {
+					selector: verifiedSelector,
+					x: event.clientX,
+					y: event.clientY,
+					altKey: event.altKey,
+					ctrlKey: event.ctrlKey,
+					shiftKey: event.shiftKey,
+					metaKey: event.metaKey,
+					button: event.button,
+					type: event.type,
+					tagName: event.target.tagName,
+					href: event.target.href,
+					value: event.target.value,
+					checked: event.target.checked,
+					// Add text content to help verify correct element
+					textContent: event.target.textContent.trim(),
+				};
+
+				switch (event.target.tagName.toLowerCase()) {
+					case 'a':
+						event.preventDefault(); // Prevent navigation
+						break;
+				}
+
+				// Send click event to server
+				isFirstLoad = false;
+				eventBus.send('browser.click', clickData, (error, response) => {
+					if (error) {
+						updateStatus('Click sync failed: ' + error.message, 'error');
+					} else {
+						updateStatus('Click sync successful', 'success');
+					}
+				});
+			}
+
+			function observeChanges(doc) {
+				console.log(isFirstLoad);
+				if (mutationObserver) {
+					mutationObserver.disconnect();
+				}
+
+				const config = {
+					attributes: true,
+					childList: true,
+					subtree: true,
+					// attributeFilter: ['style', 'class'],
+					attributeOldValue: true,
+				};
+
+				mutationObserver = new MutationObserver((mutations) => {
+					if (isProcessingServerUpdate) return;
+					for (let mutation of mutations) {
+						if (!isFirstLoad) {
+							console.log(
+								mutation.type,
+								mutation.attributeName,
+								mutation.target,
+								mutation.oldValue,
+								mutation.target.value
+							);
+							if (
+								mutation.type == 'attributes' &&
+								(mutation.attributeName == 'class' ||
+									mutation.attributeName == 'aria-invalid')
+							) {
+								eventBus.send('browser.domEvent', {
+									type: mutation.type,
+									target: generateUniqueSelector(mutation.target),
+									attributeName: mutation.attributeName,
+									oldValue: mutation.oldValue,
+									newValue: mutation.target.value,
+								});
+							}
+						}
+					}
+				});
+
+				mutationObserver.observe(doc, config);
+			}
+
+			function generateSelector(element) {
+				if (element.id) {
+					return '#' + element.id;
+				}
+
+				if (element.className) {
+					return '.' + Array.from(element.classList).join('.');
+				}
+
+				let selector = element.tagName.toLowerCase();
+				const parent = element.parentElement;
+
+				if (parent && parent.children.length > 1) {
+					const index = Array.from(parent.children).indexOf(element);
+					selector += `:nth-child(${index + 1})`;
+				}
+
+				return selector;
+			}
+
+			function updateStatus(message, type) {
+				const status = document.getElementById('status');
+				status.textContent = message;
+				status.className = 'status ' + type;
+			}
+
+			// Initialize on page load
+			window.onload = initializeEventBus;
+		</script>
+	</body>
+</html>
